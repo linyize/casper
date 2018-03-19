@@ -364,7 +364,7 @@ def proc_reward(validator_index: num, reward: num(wei/m)):
         self.next_dynasty_wei_delta -= reward
     if current_dynasty == end_dynasty - 2:
         self.second_next_dynasty_wei_delta -= reward
-    send(block.coinbase, floor(reward * self.deposit_scale_factor[self.current_epoch] / 8))
+    #send(block.coinbase, floor(reward * self.deposit_scale_factor[self.current_epoch] / 8))
 
 # Process a vote message
 @public

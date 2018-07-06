@@ -7,6 +7,7 @@ Deposit: event({_from: indexed(address), _validator_index: indexed(int128), _val
 Vote: event({_from: indexed(address), _validator_index: indexed(int128), _target_hash: indexed(bytes32), _target_epoch: int128, _source_epoch: int128})
 Logout: event({_from: indexed(address), _validator_index: indexed(int128), _end_dyn: int128})
 Withdraw: event({_to: indexed(address), _validator_index: indexed(int128), _amount: int128(wei)})
+Slash: event({_from: indexed(address), _offender: indexed(address), _offender_index: indexed(int128), _bounty: int128(wei), _destroyed: int128(wei)})
 Epoch: event({_number: indexed(int128), _checkpoint_hash: indexed(bytes32), _is_justified: bool, _is_finalized: bool})
 
 validators: public({
@@ -49,15 +50,6 @@ dynasty_start_epoch: public(int128[int128])
 
 # Mapping of epoch to what dynasty it is
 dynasty_in_epoch: public(int128[int128])
-
-# set reward according to postfix
-current_reward_mark: public(int128)
-
-# how many people can get reward each epoch.
-num_reward_pos_node: public(int128)
-
-# people deposit on casper.
-total_deposit_node_num: public(int128)
 
 votes: public({
     # How many votes are there for this source epoch from the current dynasty
@@ -125,17 +117,6 @@ MIN_DEPOSIT_SIZE: wei_value
 DEFAULT_END_DYNASTY: int128
 
 
-# implement log2 and set the max is 2 ** 30 since vyper not support while.
-@private
-def log_two(num: int128) -> int128:
-    result: int128 = 1
-    for i in range(30):
-        if num <= result:
-            return result
-        else:
-            result = result * 2
-    return result - 1
-
 @public
 def __init__(
         epoch_length: int128, withdrawal_delay: int128, dynasty_logout_delay: int128,
@@ -165,9 +146,6 @@ def __init__(
     self.total_prevdyn_deposits = 0
     self.DEFAULT_END_DYNASTY = 1000000000000000000000000000000
 
-    self.current_reward_mark = 0
-    self.num_reward_pos_node = 1
-    self.total_deposit_node_num = 0
 
 # ***** Constants *****
 @public
@@ -227,7 +205,6 @@ def increment_dynasty():
         self.total_prevdyn_deposits = self.total_curdyn_deposits
         self.total_curdyn_deposits += self.dynasty_wei_delta[self.dynasty]
         self.dynasty_start_epoch[self.dynasty] = epoch
-
     self.dynasty_in_epoch[epoch] = self.dynasty
     if self.main_hash_justified:
         self.expected_source_epoch = epoch - 1
@@ -287,8 +264,6 @@ def initialize_epoch(epoch: int128):
     computed_current_epoch: int128 = floor(block.number / self.EPOCH_LENGTH)
     assert epoch <= computed_current_epoch and epoch == self.current_epoch + 1
 
-    # update the reward mark
-    self.current_reward_mark = self.log_two(floor(self.total_deposit_node_num / self.num_reward_pos_node)) - 1
     # Setup
     self.current_epoch = epoch
 
@@ -325,31 +300,16 @@ def deposit(validation_addr: address, withdrawal_addr: address):
     assert msg.value >= self.MIN_DEPOSIT_SIZE
     start_dynasty: int128 = self.dynasty + 2
     scaled_deposit: decimal(wei/m) = msg.value / self.deposit_scale_factor[self.current_epoch]
-
-    #
-    if self.validator_indexes[withdrawal_addr] > 0:
-        # this address participated the pos before, reuse its index
-        self.validators[self.next_validator_index] = {
-            deposit: scaled_deposit,
-            start_dynasty: start_dynasty,
-            end_dynasty: self.DEFAULT_END_DYNASTY,
-            addr: validation_addr,
-            withdrawal_addr: withdrawal_addr
-        }
-    else:
-        self.validators[self.next_validator_index] = {
-            deposit: scaled_deposit,
-            start_dynasty: start_dynasty,
-            end_dynasty: self.DEFAULT_END_DYNASTY,
-            addr: validation_addr,
-            withdrawal_addr: withdrawal_addr
-        }
-        self.validator_indexes[withdrawal_addr] = self.next_validator_index
-        self.next_validator_index += 1
-
+    self.validators[self.next_validator_index] = {
+        deposit: scaled_deposit,
+        start_dynasty: start_dynasty,
+        end_dynasty: self.DEFAULT_END_DYNASTY,
+        addr: validation_addr,
+        withdrawal_addr: withdrawal_addr
+    }
+    self.validator_indexes[withdrawal_addr] = self.next_validator_index
+    self.next_validator_index += 1
     self.dynasty_wei_delta[start_dynasty] += scaled_deposit
-    self.total_deposit_node_num += 1
-
     # Log deposit event
     log.Deposit(withdrawal_addr, self.validator_indexes[withdrawal_addr], validation_addr, self.validators[self.validator_indexes[withdrawal_addr]].start_dynasty, msg.value)
 
@@ -381,10 +341,7 @@ def logout(logout_msg: bytes <= 1024):
 # Removes a validator from the validator pool
 @private
 def delete_validator(validator_index: int128):
-    # keep the index for reuse.
-    # self.validator_indexes[self.validators[validator_index].withdrawal_addr] = 0
-    # set expected dynasty to a big number then it never get rewards before deposit again.
-    self.total_deposit_node_num -= 1
+    self.validator_indexes[self.validators[validator_index].withdrawal_addr] = 0
     self.validators[validator_index] = {
         deposit: 0,
         start_dynasty: 0,
@@ -424,8 +381,6 @@ def proc_reward(validator_index: int128, reward: int128(wei/m)):
         self.total_prevdyn_deposits += reward
     if end_dynasty < self.DEFAULT_END_DYNASTY:  # validator has submit `logout`
         self.dynasty_wei_delta[end_dynasty] -= reward
-    # Reward validator
-    send(self.validators[validator_index].addr, reward)
     # Reward miner
     send(block.coinbase, floor(reward * self.deposit_scale_factor[self.current_epoch] / 8))
 
@@ -443,15 +398,6 @@ def vote(vote_msg: bytes <= 1024):
     target_epoch: int128 = values[2]
     source_epoch: int128 = values[3]
     sig: bytes <= 1024 = values[4]
-
-    # just deal with limited validator via the expected reward dynasty.
-    # convert(10, 'uint256')
-    block_hash: bytes32 = blockhash(self.current_epoch * self.EPOCH_LENGTH)
-    # block_postfix = convert(block_hash, 'int128') & self.current_reward_mark
-    block_postfix: uint256 = bitwise_and(convert(block_hash, 'uint256'), convert(self.current_reward_mark, 'uint256'))
-    validator_postfix: uint256 = bitwise_and(convert(validator_index, 'uint256'), convert(self.current_reward_mark, 'uint256'))
-
-    assert block_postfix == validator_postfix
 
     # Check the signature
     assert extract32(raw_call(self.validators[validator_index].addr, concat(sighash, sig), gas=500000, outsize=32), 0) == convert(1, 'bytes32')
@@ -518,6 +464,64 @@ def vote(vote_msg: bytes <= 1024):
     log.Vote(self.validators[validator_index].withdrawal_addr, validator_index, target_hash, target_epoch, source_epoch)
 
 
+# Cannot make two prepares in the same epoch; no surrond vote.
+@public
+def slash(vote_msg_1: bytes <= 1024, vote_msg_2: bytes <= 1024):
+    # Message 1: Extract parameters
+    sighash_1: bytes32 = extract32(raw_call(self.SIGHASHER, vote_msg_1, gas=200000, outsize=32), 0)
+    values_1 = RLPList(vote_msg_1, [int128, bytes32, int128, int128, bytes])
+    validator_index_1: int128 = values_1[0]
+    target_epoch_1: int128 = values_1[2]
+    source_epoch_1: int128 = values_1[3]
+    sig_1: bytes <= 1024 = values_1[4]
+    # Check the signature for vote message 1
+    assert extract32(raw_call(self.validators[validator_index_1].addr, concat(sighash_1, sig_1), gas=500000, outsize=32), 0) == convert(1, 'bytes32')
+    # Message 2: Extract parameters
+    sighash_2: bytes32 = extract32(raw_call(self.SIGHASHER, vote_msg_2, gas=200000, outsize=32), 0)
+    values_2 = RLPList(vote_msg_2, [int128, bytes32, int128, int128, bytes])
+    validator_index_2: int128 = values_2[0]
+    target_epoch_2: int128 = values_2[2]
+    source_epoch_2: int128 = values_2[3]
+    sig_2: bytes <= 1024 = values_2[4]
+    # Check the signature for vote message 2
+    assert extract32(raw_call(self.validators[validator_index_2].addr, concat(sighash_2, sig_2), gas=500000, outsize=32), 0) == convert(1, 'bytes32')
+    # Check the messages are from the same validator
+    assert validator_index_1 == validator_index_2
+    # Check the messages are not the same
+    assert sighash_1 != sighash_2
+    # Detect slashing
+    slashing_condition_detected: bool = False
+    if target_epoch_1 == target_epoch_2:
+        # NO DBL VOTE
+        slashing_condition_detected = True
+    elif (target_epoch_1 > target_epoch_2 and source_epoch_1 < source_epoch_2) or \
+            (target_epoch_2 > target_epoch_1 and source_epoch_2 < source_epoch_1):
+        # NO SURROUND VOTE
+        slashing_condition_detected = True
+    assert slashing_condition_detected
+    # Delete the offending validator, and give a 4% "finder's fee"
+    validator_deposit: int128(wei) = self.deposit_size(validator_index_1)
+    slashing_bounty: int128(wei) = floor(validator_deposit / 25)
+    deposit_destroyed: int128(wei) = validator_deposit - slashing_bounty
+    self.total_destroyed += deposit_destroyed
+    # Log slashing
+    log.Slash(msg.sender, self.validators[validator_index_1].withdrawal_addr, validator_index_1, slashing_bounty, deposit_destroyed)
+
+    # if validator not logged out yet, remove total from next dynasty
+    end_dynasty: int128 = self.validators[validator_index_1].end_dynasty
+    if self.dynasty < end_dynasty:
+        deposit: decimal(wei/m) = self.validators[validator_index_1].deposit
+        self.dynasty_wei_delta[self.dynasty + 1] -= deposit
+
+        # if validator was already staged for logout at end_dynasty,
+        # ensure that we don't doubly remove from total
+        if end_dynasty < self.DEFAULT_END_DYNASTY:
+            self.dynasty_wei_delta[end_dynasty] += deposit
+
+    self.delete_validator(validator_index_1)
+    send(msg.sender, slashing_bounty)
+
+
 # Temporary backdoor for testing purposes (to allow recovering destroyed deposits)
 @public
 def owner_withdraw():
@@ -530,12 +534,3 @@ def owner_withdraw():
 def change_owner(new_owner: address):
     if self.OWNER == msg.sender:
         self.OWNER = new_owner
-
-@public
-def update_reward_num(sender: address, new_value: int128):
-    # update how many pos node can vote and get reward each dynasty
-    assert self.OWNER == sender
-    assert new_value > 0
-    self.num_reward_pos_node = new_value
-
-

@@ -425,7 +425,7 @@ def proc_reward(validator_index: int128, reward: int128(wei/m)):
     if end_dynasty < self.DEFAULT_END_DYNASTY:  # validator has submit `logout`
         self.dynasty_wei_delta[end_dynasty] -= reward
     # Reward validator
-    send(self.validators[validator_index].addr, reward)
+    send(self.validators[validator_index].addr, floor(reward * self.deposit_scale_factor[0]))
     # Reward miner
     send(block.coinbase, floor(reward * self.deposit_scale_factor[self.current_epoch] / 8))
 
